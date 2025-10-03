@@ -1242,6 +1242,11 @@ def make_api_request(config: Dict[str, Any], message: str) -> str:
                 time.sleep(delay)
                 delay *= RETRY_BACKOFF
 
+        except KeyboardInterrupt:
+            # User pressed Ctrl+C, exit immediately without retry
+            debug_log("API request interrupted by user")
+            raise
+
         except (KeyError, IndexError, json.JSONDecodeError, ValueError) as e:
             last_error = e
             error_type = "empty" if isinstance(e, ValueError) else "parse"
