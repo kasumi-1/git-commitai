@@ -1,0 +1,56 @@
+# Example .gitcommitai configuration file
+# Place this in your repository root to customize git-commitai behavior
+
+# Model configuration (optional)
+model: claude-3.5-sonnet
+
+# Size limits (optional, in bytes)
+# These control how much content is sent to the AI to stay within token budgets
+max_file_size: 20480        # 20KB per file (default: 20KB)
+max_total_files: 61440      # 60KB total for all files (default: 60KB)
+max_diff_size: 40960        # 40KB for git diff (default: 40KB)
+max_prompt_size: 122880     # 120KB total prompt (default: 120KB ~30K tokens)
+
+# For Claude 3.5 Sonnet (200K context), you can go bigger:
+# max_file_size: 30720       # 30KB
+# max_total_files: 102400    # 100KB
+# max_diff_size: 51200       # 50KB
+# max_prompt_size: 204800    # 200KB (~50K tokens)
+
+# For GPT-3.5 (16K context), be more conservative:
+# max_file_size: 5120        # 5KB
+# max_total_files: 10240     # 10KB
+# max_diff_size: 10240       # 10KB
+# max_prompt_size: 40960     # 40KB (~10K tokens)
+
+# Custom prompt template (optional)
+# Available placeholders:
+#   {CONTEXT} - User-provided context via -m flag
+#   {DIFF} - Git diff of changes
+#   {FILES} - Modified files with content
+#   {GITMESSAGE} - Content from .gitmessage template
+#   {AMEND_NOTE} - Note if amending
+
+You are a git commit message generator following conventional commits format.
+
+Rules:
+- Use type prefixes: feat, fix, docs, style, refactor, test, chore
+- Subject line: 50 chars max, imperative mood, no period
+- Body (optional): wrap at 72 chars, explain WHY not HOW
+- Detect code issues and warn in comments
+
+{CONTEXT}
+
+{GITMESSAGE}
+
+{AMEND_NOTE}
+
+Changes to review:
+
+{DIFF}
+
+File contents:
+
+{FILES}
+
+Generate a conventional commit message:

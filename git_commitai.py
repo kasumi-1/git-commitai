@@ -30,10 +30,21 @@ RETRY_BACKOFF: float = 1.5  # backoff multiplier for each retry
 
 REQ_TIMEOUT: int = 300  # 5 minutes timeout for requests
 
-# File size limit for including in AI prompt (100 KB by default)
-# Files larger than this will only include metadata, not full content
-# Can be overridden with GIT_COMMIT_AI_MAX_FILE_SIZE environment variable
-MAX_FILE_SIZE: int = int(os.environ.get("GIT_COMMIT_AI_MAX_FILE_SIZE", 100 * 1024))
+# Prompt size limits to stay within model token budgets
+# Default limits target 32K-64K token models (GPT-4, Claude 3.5, etc.)
+# Can be overridden with environment variables or .gitcommitai config
+
+# Per-file limit: Files larger than this will only include metadata, not full content
+MAX_FILE_SIZE: int = int(os.environ.get("GIT_COMMIT_AI_MAX_FILE_SIZE", 20 * 1024))  # 20KB
+
+# Total files limit: All file contents combined cannot exceed this
+MAX_TOTAL_FILES: int = int(os.environ.get("GIT_COMMIT_AI_MAX_TOTAL_FILES", 60 * 1024))  # 60KB
+
+# Diff size limit: Git diff output truncated if larger
+MAX_DIFF_SIZE: int = int(os.environ.get("GIT_COMMIT_AI_MAX_DIFF_SIZE", 40 * 1024))  # 40KB
+
+# Total prompt size limit (safety margin for model context)
+MAX_PROMPT_SIZE: int = int(os.environ.get("GIT_COMMIT_AI_MAX_PROMPT_SIZE", 120 * 1024))  # 120KB (~30K tokens)
 
 
 def redact_secrets(message: Union[str, Any]) -> str:
@@ -186,16 +197,40 @@ def load_gitcommitai_config() -> Dict[str, Any]:
             except json.JSONDecodeError:
                 debug_log("Failed to parse as JSON, treating as template")
 
-        # Check for model specification at the top of the file
+        # Parse configuration lines at the top of the file
         lines: List[str] = content.split('\n')
         template_lines: List[str] = []
 
         for line in lines:
+            stripped = line.strip()
+
             # Check for model specification (e.g., "model: gpt-4" or "model=gpt-4")
-            if line.strip().startswith('model:') or line.strip().startswith('model='):
+            if stripped.startswith('model:') or stripped.startswith('model='):
                 model_value: str = line.split(':', 1)[1] if ':' in line else line.split('=', 1)[1]
                 config['model'] = model_value.strip()
                 debug_log(f"Found model specification: {config['model']}")
+
+            # Check for size limit overrides
+            elif stripped.startswith('max_file_size:') or stripped.startswith('max_file_size='):
+                size_value: str = line.split(':', 1)[1] if ':' in line else line.split('=', 1)[1]
+                config['max_file_size'] = int(size_value.strip())
+                debug_log(f"Found max_file_size override: {config['max_file_size']}")
+
+            elif stripped.startswith('max_total_files:') or stripped.startswith('max_total_files='):
+                size_value = line.split(':', 1)[1] if ':' in line else line.split('=', 1)[1]
+                config['max_total_files'] = int(size_value.strip())
+                debug_log(f"Found max_total_files override: {config['max_total_files']}")
+
+            elif stripped.startswith('max_diff_size:') or stripped.startswith('max_diff_size='):
+                size_value = line.split(':', 1)[1] if ':' in line else line.split('=', 1)[1]
+                config['max_diff_size'] = int(size_value.strip())
+                debug_log(f"Found max_diff_size override: {config['max_diff_size']}")
+
+            elif stripped.startswith('max_prompt_size:') or stripped.startswith('max_prompt_size='):
+                size_value = line.split(':', 1)[1] if ':' in line else line.split('=', 1)[1]
+                config['max_prompt_size'] = int(size_value.strip())
+                debug_log(f"Found max_prompt_size override: {config['max_prompt_size']}")
+
             else:
                 template_lines.append(line)
 
@@ -245,6 +280,21 @@ def get_env_config(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Add repository-specific configuration
     config["repo_config"] = repo_config
+
+    # Apply size limit overrides from .gitcommitai config
+    global MAX_FILE_SIZE, MAX_TOTAL_FILES, MAX_DIFF_SIZE, MAX_PROMPT_SIZE
+    if 'max_file_size' in repo_config:
+        MAX_FILE_SIZE = repo_config['max_file_size']
+        debug_log(f"Applied max_file_size override: {MAX_FILE_SIZE} bytes")
+    if 'max_total_files' in repo_config:
+        MAX_TOTAL_FILES = repo_config['max_total_files']
+        debug_log(f"Applied max_total_files override: {MAX_TOTAL_FILES} bytes")
+    if 'max_diff_size' in repo_config:
+        MAX_DIFF_SIZE = repo_config['max_diff_size']
+        debug_log(f"Applied max_diff_size override: {MAX_DIFF_SIZE} bytes")
+    if 'max_prompt_size' in repo_config:
+        MAX_PROMPT_SIZE = repo_config['max_prompt_size']
+        debug_log(f"Applied max_prompt_size override: {MAX_PROMPT_SIZE} bytes")
 
     # Log config with redacted sensitive values
     debug_log(f"Config loaded - URL: {config['api_url']}, Model: {config['model']}, Key present: {bool(config['api_key'])}")
@@ -740,6 +790,8 @@ def get_staged_files(amend: bool = False, allow_empty: bool = False, skip_patter
         return ""
 
     all_files: List[str] = []
+    total_files_size: int = 0  # Track total size of all file contents
+
     for filename in files_output.split("\n"):
         if filename:
             # Check if file matches any skip pattern
@@ -805,20 +857,29 @@ def get_staged_files(amend: bool = False, allow_empty: bool = False, skip_patter
                     file_size = len(staged_content.encode('utf-8'))
                     debug_log(f"Processing file {filename} with content length: {len(staged_content)} chars, {file_size} bytes")
 
-                    # Check file size limit
+                    # Check per-file size limit
                     if file_size > MAX_FILE_SIZE:
                         size_kb = file_size / 1024
                         limit_kb = MAX_FILE_SIZE / 1024
-                        debug_log(f"File {filename} exceeds size limit ({size_kb:.1f}KB > {limit_kb:.1f}KB), including metadata only")
+                        debug_log(f"File {filename} exceeds per-file size limit ({size_kb:.1f}KB > {limit_kb:.1f}KB), including metadata only")
                         file_info_msg = f"File too large ({size_kb:.1f}KB, limit: {limit_kb:.1f}KB) - content excluded from AI prompt"
                         all_files.append(f"{filename} (large file)\n```\n{file_info_msg}\n```\n")
+                    # Check total files size limit
+                    elif total_files_size + file_size > MAX_TOTAL_FILES:
+                        remaining_kb = (MAX_TOTAL_FILES - total_files_size) / 1024
+                        debug_log(f"Adding {filename} would exceed total files limit, including metadata only (remaining budget: {remaining_kb:.1f}KB)")
+                        file_info_msg = f"File skipped to stay within total size limit ({MAX_TOTAL_FILES / 1024:.0f}KB) - content excluded from AI prompt"
+                        all_files.append(f"{filename} (size limit)\n```\n{file_info_msg}\n```\n")
                     elif staged_content or staged_content == "":  # Include empty files too
                         all_files.append(f"{filename}\n```\n{staged_content}\n```\n")
+                        total_files_size += file_size
+                        debug_log(f"Added {filename} ({file_size} bytes), total files size now: {total_files_size} bytes")
             except Exception as e:
                 debug_log(f"Error processing file {filename}: {e}")
                 # File might be newly added or have other issues, skip it
                 continue
 
+    debug_log(f"Total files content size: {total_files_size} bytes ({total_files_size / 1024:.1f}KB)")
     return "\n".join(all_files) if all_files else "# No files changed (empty commit)"
 
 
@@ -856,10 +917,42 @@ def get_git_diff(amend: bool = False, allow_empty: bool = False) -> str:
     else:
         diff = run_git(["diff", "--cached"]).strip()
 
-    debug_log(f"Diff size: {len(diff)} characters")
+    diff_size_bytes = len(diff.encode('utf-8'))
+    debug_log(f"Diff size: {len(diff)} characters, {diff_size_bytes} bytes ({diff_size_bytes / 1024:.1f}KB)")
 
     if not diff and allow_empty:
         return "```\n# No changes (empty commit)\n```"
+
+    # Check if diff exceeds size limit
+    if diff_size_bytes > MAX_DIFF_SIZE:
+        # Truncate diff intelligently: keep beginning and end
+        lines = diff.split("\n")
+        total_lines = len(lines)
+
+        # Calculate how many lines we can keep (approximation)
+        avg_line_size = diff_size_bytes / total_lines if total_lines > 0 else 100
+        lines_to_keep = int(MAX_DIFF_SIZE / avg_line_size * 0.9)  # 90% to be safe
+
+        if lines_to_keep < 20:
+            lines_to_keep = 20  # Minimum 20 lines
+
+        # Keep first and last portions
+        keep_start = lines_to_keep // 2
+        keep_end = lines_to_keep // 2
+
+        truncated_lines = (
+            lines[:keep_start] +
+            [
+                "",
+                f"# ... [TRUNCATED: {total_lines - lines_to_keep} lines omitted, diff too large] ...",
+                f"# Original size: {diff_size_bytes / 1024:.1f}KB, limit: {MAX_DIFF_SIZE / 1024:.1f}KB",
+                ""
+            ] +
+            lines[-keep_end:]
+        )
+
+        diff = "\n".join(truncated_lines)
+        debug_log(f"Diff truncated from {total_lines} lines to {len(truncated_lines)} lines")
 
     # Process the diff to add information about binary files
     diff_lines: List[str] = diff.split("\n") if diff else []
