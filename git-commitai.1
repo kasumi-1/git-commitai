@@ -14,6 +14,7 @@ git-commitai \- Generate AI-powered git commit messages
 [\fB\-v\fR|\fB\-\-verbose\fR]
 [\fB\-\-allow\-empty\fR]
 [\fB\-\-dry\-run\fR]
+[\fB\-\-skip\fR \fIpattern\fR]
 [\fB\-\-author\fR \fIauthor\fR]
 [\fB\-\-date\fR \fIdate\fR]
 [\fB\-\-debug\fR]
@@ -37,6 +38,13 @@ then generates a commit message following Git best practices and any project-spe
 .BR \-m ", " \-\-message " " \fIcontext\fR
 Provide additional context about the commit to help the AI understand your intent.
 Unlike standard \fBgit commit\fR where this sets the entire message, in \fBgit-commitai\fR this provides context for AI message generation.
+
+.TP
+.BR \-\-skip " " \fIpattern\fR
+Exclude files matching the glob pattern from being included in the AI prompt.
+The filename will still be shown to the AI, but the file content will be excluded.
+This option can be specified multiple times to exclude multiple patterns.
+Examples: \fB--skip "*.lock"\fR, \fB--skip "package-lock.json"\fR, \fB--skip "*.svg"\fR
 
 .TP
 .BR \-\-debug
@@ -118,6 +126,12 @@ The AI model to use for generation.
 Default: \fIqwen/qwen3-coder\fR
 
 .TP
+.B GIT_COMMIT_AI_MAX_FILE_SIZE
+Maximum file size (in bytes) to include in the AI prompt.
+Files larger than this will only have their filename included, not their content.
+Default: \fI102400\fR (100 KB)
+
+.TP
 .B GIT_EDITOR, EDITOR
 The editor to use for editing commit messages.
 Falls back to git's configured editor or \fBvi\fR.
@@ -164,6 +178,16 @@ $ git commitai --date "2 weeks ago"
 
 # Combine author and date overrides
 $ git commitai --author "Bot <bot@ci.com>" --date "@1705329000"
+
+# Exclude large/generated files from AI prompt
+$ git commitai --skip "package-lock.json" --skip "*.svg"
+
+# Exclude multiple patterns
+$ git commitai --skip "*.min.js" --skip "*.lock" --skip "dist/*"
+
+# Custom file size limit (50 KB)
+$ export GIT_COMMIT_AI_MAX_FILE_SIZE=51200
+$ git commitai
 .fi
 
 .SS Using Different Models

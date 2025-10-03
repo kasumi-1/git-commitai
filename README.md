@@ -130,6 +130,9 @@ After installation, the script will guide you through setting up your API creden
 export GIT_COMMIT_AI_KEY="sk-or-v1-..."
 export GIT_COMMIT_AI_URL="https://openrouter.ai/api/v1/chat/completions"
 export GIT_COMMIT_AI_MODEL="qwen/qwen3-coder"
+
+# Optional: Set max file size for AI prompt (default: 100KB)
+export GIT_COMMIT_AI_MAX_FILE_SIZE=102400  # 100KB in bytes
 ```
 
 Add these to your `~/.bashrc` or `~/.zshrc` to make them permanent.
@@ -354,6 +357,7 @@ These commands are unique to `git commitai` and not found in standard `git commi
 | Flag | Description | Purpose |
 |------|-------------|---------|
 | `-m, --message <context>` | Provide context for AI | **Modified behavior**: Unlike `git commit` where this sets the entire message, in `git commitai` this provides context to help the AI understand your intent |
+| `--skip <pattern>` | Exclude files from AI prompt | Exclude files matching glob pattern from being included in the AI prompt. Can be used multiple times (e.g., `--skip "*.lock" --skip "*.svg"`) |
 | `--debug` | Enable debug logging | Outputs debug information to stderr for troubleshooting. Shows git commands, API requests, and decision points |
 | `--api-key <key>` | Override API key | Temporarily use a different API key for this commit only. Overrides `GIT_COMMIT_AI_KEY` environment variable |
 | `--api-url <url>` | Override API endpoint | Use a different API endpoint for this commit. Useful for testing different providers or local models |
@@ -471,6 +475,13 @@ git commitai --model "gpt-4o" --api-key "sk-..."
 
 # Use local LLM for sensitive code
 git commitai --api-url "http://localhost:11434/v1/chat/completions" --model "codellama"
+
+# Exclude large files from AI prompt (package-lock.json, SVGs, etc.)
+git commitai --skip "package-lock.json" --skip "*.svg" --skip "*.min.js"
+
+# Exclude files with custom size limit
+export GIT_COMMIT_AI_MAX_FILE_SIZE=51200  # 50KB
+git commitai
 
 # Preview with dry-run and debug
 git commitai --dry-run --debug 2>&1 | tee preview.log

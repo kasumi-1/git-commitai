@@ -11,6 +11,7 @@ import argparse
 import time
 import re
 from datetime import datetime
+from fnmatch import fnmatch
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -28,6 +29,11 @@ RETRY_DELAY: int = 2  # seconds between retries
 RETRY_BACKOFF: float = 1.5  # backoff multiplier for each retry
 
 REQ_TIMEOUT: int = 300  # 5 minutes timeout for requests
+
+# File size limit for including in AI prompt (100 KB by default)
+# Files larger than this will only include metadata, not full content
+# Can be overridden with GIT_COMMIT_AI_MAX_FILE_SIZE environment variable
+MAX_FILE_SIZE: int = int(os.environ.get("GIT_COMMIT_AI_MAX_FILE_SIZE", 100 * 1024))
 
 
 def redact_secrets(message: Union[str, Any]) -> str:
@@ -690,16 +696,19 @@ def get_binary_file_info(filename: str, amend: bool = False) -> str:
     )
 
 
-def get_staged_files(amend: bool = False, allow_empty: bool = False) -> str:
+def get_staged_files(amend: bool = False, allow_empty: bool = False, skip_patterns: Optional[List[str]] = None) -> str:
     """Get list of staged files with their staged contents.
 
     Args:
         amend: Whether we're amending a commit
         allow_empty: Whether this is an empty commit
+        skip_patterns: List of glob patterns to exclude from AI prompt
 
     Returns:
         Formatted string with file contents
     """
+    if skip_patterns is None:
+        skip_patterns = []
     debug_log(f"Getting staged files - amend: {amend}, allow_empty: {allow_empty}")
 
     files_output: str
@@ -733,6 +742,21 @@ def get_staged_files(amend: bool = False, allow_empty: bool = False) -> str:
     all_files: List[str] = []
     for filename in files_output.split("\n"):
         if filename:
+            # Check if file matches any skip pattern
+            skip_file = False
+            skip_pattern_matched = None
+            for pattern in skip_patterns:
+                if fnmatch(filename, pattern):
+                    debug_log(f"Skipping file content for {filename} (matches pattern: {pattern})")
+                    skip_file = True
+                    skip_pattern_matched = pattern
+                    break
+
+            if skip_file:
+                # Include filename but not content
+                all_files.append(f"{filename} (skipped: matches pattern '{skip_pattern_matched}')\n```\nFile content excluded from AI prompt\n```\n")
+                continue
+
             try:
                 # Check if file is binary
                 is_binary_check: str
@@ -778,11 +802,17 @@ def get_staged_files(amend: bool = False, allow_empty: bool = False) -> str:
                         ).strip()
 
                     # Redact any secrets in file content before including in debug logs
-                    debug_log(f"Processing file {filename} with content length: {len(staged_content)}")
+                    file_size = len(staged_content.encode('utf-8'))
+                    debug_log(f"Processing file {filename} with content length: {len(staged_content)} chars, {file_size} bytes")
 
-                    if (
-                        staged_content or staged_content == ""
-                    ):  # Include empty files too
+                    # Check file size limit
+                    if file_size > MAX_FILE_SIZE:
+                        size_kb = file_size / 1024
+                        limit_kb = MAX_FILE_SIZE / 1024
+                        debug_log(f"File {filename} exceeds size limit ({size_kb:.1f}KB > {limit_kb:.1f}KB), including metadata only")
+                        file_info_msg = f"File too large ({size_kb:.1f}KB, limit: {limit_kb:.1f}KB) - content excluded from AI prompt"
+                        all_files.append(f"{filename} (large file)\n```\n{file_info_msg}\n```\n")
+                    elif staged_content or staged_content == "":  # Include empty files too
                         all_files.append(f"{filename}\n```\n{staged_content}\n```\n")
             except Exception as e:
                 debug_log(f"Error processing file {filename}: {e}")
@@ -1091,6 +1121,11 @@ def make_api_request(config: Dict[str, Any], message: str) -> str:
             with urlopen(req, timeout=REQ_TIMEOUT) as response:
                 data: Dict[str, Any] = json.loads(response.read().decode("utf-8"))
                 result: str = data["choices"][0]["message"]["content"]
+
+                # Check for empty response
+                if not result or not result.strip():
+                    raise ValueError("API returned empty response")
+
                 debug_log(f"API request successful on attempt {attempt}, response length: {len(result)} characters")
                 return result
 
@@ -1114,9 +1149,10 @@ def make_api_request(config: Dict[str, Any], message: str) -> str:
                 time.sleep(delay)
                 delay *= RETRY_BACKOFF
 
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
+        except (KeyError, IndexError, json.JSONDecodeError, ValueError) as e:
             last_error = e
-            debug_log(f"Failed to parse API response on attempt {attempt}: {e}")
+            error_type = "empty" if isinstance(e, ValueError) else "parse"
+            debug_log(f"Failed to {error_type} API response on attempt {attempt}: {e}")
 
             if attempt < MAX_RETRIES:
                 debug_log(f"Retrying in {delay} seconds...")
@@ -1515,6 +1551,12 @@ For more information, visit: https://github.com/semperai/git-commitai
         help="Override author date (format: 'YYYY-MM-DD HH:MM:SS' or ISO 8601)",
     )
     parser.add_argument(
+        "--skip",
+        action="append",
+        metavar="PATTERN",
+        help="Exclude files matching glob pattern from AI prompt (can be used multiple times)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging to stderr",
@@ -1576,7 +1618,8 @@ For more information, visit: https://github.com/semperai/git-commitai
 
     # Get git information
     git_diff: str = get_git_diff(amend=args.amend, allow_empty=args.allow_empty)
-    all_files: str = get_staged_files(amend=args.amend, allow_empty=args.allow_empty)
+    skip_patterns: Optional[List[str]] = args.skip if hasattr(args, 'skip') and args.skip else None
+    all_files: str = get_staged_files(amend=args.amend, allow_empty=args.allow_empty, skip_patterns=skip_patterns)
 
     # Handle template placeholders if using custom template
     if config["repo_config"].get('prompt_template'):
@@ -1691,4 +1734,9 @@ Generate the commit message following the rules above:"""
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Exit quietly on Ctrl+C
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)  # Standard exit code for SIGINT
